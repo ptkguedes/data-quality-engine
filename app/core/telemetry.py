@@ -11,9 +11,11 @@ inacessivel nao derruba o startup nem falha uma requisicao. Com
 suite de testes e as execucoes locais sem Jaeger rodam.
 """
 
-import logging
+from __future__ import annotations
 
-from fastapi import FastAPI
+import logging
+from typing import TYPE_CHECKING
+
 from opentelemetry import metrics, trace
 from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import OTLPMetricExporter
 from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
@@ -32,6 +34,12 @@ from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.core.config import Settings
+
+if TYPE_CHECKING:  # pragma: no cover - apenas para anotacao de tipo
+    # `app/api` e `app/main.py` sao as unicas partes do codigo que usam as
+    # primitivas do FastAPI em tempo de execucao; aqui o tipo serve so para
+    # anotar o parametro que sera entregue ao FastAPIInstrumentor.
+    from fastapi import FastAPI
 
 logger = logging.getLogger(__name__)
 

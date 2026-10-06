@@ -709,7 +709,7 @@ class DataQualityEngine:
 
         Uma rejeicao e um resultado de negocio: ela aparece no
         `ValidationResult`, no status do span e no evento de span
-        `event.rejected` (decisao D15).
+        `event.rejected` (decisoes D4 e D7).
         """
         started = perf_counter()
         with _tracer.start_as_current_span(SPAN_VALIDATE) as span:

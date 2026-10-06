@@ -25,11 +25,11 @@ importa nada das outras camadas.
 
 | Camada | Pasta | Responsabilidade | Restrição |
 |---|---|---|---|
-| API | `app/api/` | Rotas, parsing do corpo, injeção de dependência, mapeamento de status HTTP | É a **única** camada que importa `fastapi` |
+| API | `app/api/` | Rotas, parsing do corpo, injeção de dependência, mapeamento de status HTTP | É a **única** camada que usa as primitivas HTTP do `fastapi` (`APIRouter`, `Request`, `Depends`, `HTTPException`) |
 | Services | `app/services/` | `DataQualityEngine` (catálogo de regras) e `IngestionService` (validar → persistir) | Não importa `fastapi` |
 | Domain | `app/domain/` | Enums, erros, schemas Pydantic v2, modelos ORM e os objetos de valor das regras | Não importa `app.api`, `app.services` nem `app.infrastructure` |
-| Infrastructure | `app/infrastructure/` | Engine/sessão assíncrona, `create_all`, repositórios | Depende só do `domain` |
-| Core | `app/core/` | `Settings` (pydantic-settings), logging JSON, OpenTelemetry | Transversal |
+| Infrastructure | `app/infrastructure/` | Engine/sessão assíncrona, `create_all`, repositórios | Depende só de `app.domain` e `app.core` |
+| Core | `app/core/` | `Settings` (pydantic-settings), logging JSON, OpenTelemetry | Transversal: não importa nenhuma outra camada da `app`. `telemetry.py` recebe a instância da app apenas para instrumentá-la (`FastAPIInstrumentor`) |
 
 ### Estrutura de pastas
 
@@ -98,7 +98,7 @@ graph TD
     INF["app/infrastructure (engine assincrono, repositorios)"] --> DOM
     API --> INF
     SVC --> INF
-    CORE["app/core (Settings, logging JSON, OpenTelemetry)"] --> DOM
+    CORE["app/core (Settings, logging JSON, OpenTelemetry) - nao importa camada alguma"]
     API --> CORE
     SVC --> CORE
     INF --> CORE
@@ -584,11 +584,15 @@ configuração do SDK está dentro de um `try/except` que só registra um warnin
 
 ### Sobre a tag do Jaeger
 
-A imagem está pinada em `jaegertracing/all-in-one:1.62`. A tag foi fixada sem um `pull` de
-verificação no registry, porque o daemon do Docker não estava disponível no ambiente de
-desenvolvimento. Se o pull falhar, `jaegertracing/all-in-one:1.57` e
-`jaegertracing/all-in-one:latest` são alternativas diretas — a única exigência é uma versão
-que aceite OTLP (1.35 ou mais nova).
+A imagem está pinada em `jaegertracing/all-in-one:1.62.0`, com a versão de patch completa.
+O alias curto `1.62` **não existe** no registry: o repositório publica `1.62.0`, e um
+`docker compose up` apontando para `1.62` falharia no pull. Como o daemon do Docker não
+estava disponível no ambiente de desenvolvimento, a tag foi conferida direto na API de tags
+do Docker Hub, não por `docker pull`.
+
+Alternativas diretas, caso o pull falhe: `jaegertracing/all-in-one:1.57` (esse repositório
+ainda publica o alias curto) ou `jaegertracing/all-in-one:latest`. A única exigência é uma
+versão que aceite OTLP nativamente — 1.35 ou mais nova.
 
 ---
 
@@ -602,5 +606,5 @@ que aceite OTLP (1.35 ou mais nova).
 | SQLAlchemy | 2.0.36 (async) + asyncpg 0.30.0 |
 | PostgreSQL | 15 (`postgres:15-alpine`) |
 | OpenTelemetry | API/SDK 1.29.0, instrumentações 0.50b0 |
-| Jaeger | all-in-one 1.62 |
+| Jaeger | all-in-one 1.62.0 |
 | pytest | 8.3.4 + pytest-asyncio 0.25.0 |
