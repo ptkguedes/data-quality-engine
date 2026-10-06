@@ -110,6 +110,39 @@ def test_non_uuid_event_id_is_sanitized(settings: Settings) -> None:
     assert result.sanitized_event["event_id"] == "evt-42"
 
 
+def test_long_envelope_strings_are_truncated_to_the_column_width(
+    settings: Settings,
+) -> None:
+    """Strings do envelope sao truncadas pelo motor, nao pelo `String(128)`.
+
+    Sem isso o INSERT falharia no PostgreSQL - inclusive o do dead letter, que
+    e a trilha que a arquitetura promete nunca perder.
+    """
+    limit = settings.max_envelope_string_length
+    result = _engine(settings).validate(
+        _event(event_id="e" * (limit + 10), event_type="t" * (limit + 10))
+    )
+
+    assert result.status is EventStatus.SUCCESS
+    assert RejectionReason.ENVELOPE_STRING_TOO_LONG in _sanitization_codes(result)
+    assert len(result.sanitized_event["event_id"]) == limit
+    assert len(result.sanitized_event["event_type"]) == limit
+
+
+def test_long_envelope_strings_are_truncated_on_the_rejected_path(
+    settings: Settings,
+) -> None:
+    """Mesmo rejeitado, o `event_id` sai curto o suficiente para o dead letter."""
+    limit = settings.max_envelope_string_length
+    raw = _event(source="s" * (limit + 10), payload={"value": -1})
+
+    result = _engine(settings).validate(raw)
+
+    assert result.status is EventStatus.REJECTED
+    assert len(result.sanitized_event["source"]) == limit
+    assert len(raw["source"]) == limit + 10  # o original segue intocado
+
+
 def test_unparseable_timestamp_is_rejected(settings: Settings) -> None:
     """Timestamp que nao e ISO-8601 e ERROR INVALID_TIMESTAMP."""
     result = _engine(settings).validate(_event(timestamp="ontem de manha"))
@@ -324,6 +357,18 @@ def test_stale_timestamp_is_rejected(settings: Settings) -> None:
     assert RejectionReason.TIMESTAMP_TOO_OLD in _violation_codes(result)
 
 
+def test_value_floor_comes_from_settings(settings: Settings) -> None:
+    """`VALUE_MIN` e configuravel: com piso -10, `value: -5` passa."""
+    permissive = settings.model_copy(update={"value_min": -10.0})
+
+    rejected = _engine(settings).validate(_event(payload={"value": -5}))
+    accepted = _engine(permissive).validate(_event(payload={"value": -5}))
+
+    assert rejected.status is EventStatus.REJECTED
+    assert RejectionReason.NEGATIVE_VALUE in _violation_codes(rejected)
+    assert accepted.status is EventStatus.SUCCESS
+
+
 def test_duplicate_event_id_is_rejected_on_second_sight(settings: Settings) -> None:
     """O mesmo `event_id` duas vezes: a segunda e DUPLICATE_EVENT_ID (D10)."""
     engine = _engine(settings)
@@ -335,6 +380,44 @@ def test_duplicate_event_id_is_rejected_on_second_sight(settings: Settings) -> N
     assert first.status is EventStatus.SUCCESS
     assert second.status is EventStatus.REJECTED
     assert RejectionReason.DUPLICATE_EVENT_ID in _violation_codes(second)
+
+
+def test_rejected_event_id_never_enters_the_dedup_window(settings: Settings) -> None:
+    """Um evento rejeitado nao consome o `event_id`: a correcao pode voltar."""
+    engine = _engine(settings)
+
+    rejected = engine.validate(_event(event_id=FIXED_UUID, payload={"value": -1}))
+    corrected = engine.validate(_event(event_id=FIXED_UUID, payload={"value": 1}))
+
+    assert rejected.status is EventStatus.REJECTED
+    assert corrected.status is EventStatus.SUCCESS
+
+
+def test_released_reservation_frees_the_event_id_for_a_retry(
+    settings: Settings,
+) -> None:
+    """`release_dedup` desfaz a reserva de uma transacao que nao commitou."""
+    engine = _engine(settings)
+
+    first = engine.validate(_event(event_id=FIXED_UUID))
+    engine.release_dedup([FIXED_UUID])
+    retried = engine.validate(_event(event_id=FIXED_UUID))
+
+    assert first.status is EventStatus.SUCCESS
+    assert retried.status is EventStatus.SUCCESS
+
+
+def test_confirmed_event_id_stays_in_the_window(settings: Settings) -> None:
+    """Depois de `confirm_dedup` a entrada e definitiva: `release` nao a apaga."""
+    engine = _engine(settings)
+
+    engine.validate(_event(event_id=FIXED_UUID))
+    engine.confirm_dedup([FIXED_UUID])
+    engine.release_dedup([FIXED_UUID])
+
+    assert engine.validate(_event(event_id=FIXED_UUID)).status is (
+        EventStatus.REJECTED
+    )
 
 
 def test_dedup_window_is_bounded(settings: Settings) -> None:
@@ -401,6 +484,7 @@ def test_every_rejection_reason_is_produced_by_some_rule(settings: Settings) -> 
         _event(payload={"value": -1}),
         _event(payload={"temperature": "quente"}),
         _event(payload={"label": "x" * (settings.max_string_length + 1)}),
+        _event(source="s" * (settings.max_envelope_string_length + 1)),
         _event(source="  gateway-01  "),
         _event(timestamp=(utcnow() + timedelta(days=1)).isoformat()),
         _event(timestamp=(utcnow() - timedelta(days=400)).isoformat()),

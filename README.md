@@ -116,7 +116,16 @@ docker compose up --build
 
 Três contêineres sobem: a API, o PostgreSQL 15 e o Jaeger all-in-one. A API só inicia
 depois do healthcheck `pg_isready` do banco passar (`depends_on` com
-`condition: service_healthy`).
+`condition: service_healthy`), e ela própria tem healthcheck batendo em `/health` pela
+stdlib do Python (a imagem `python:3.12-slim` não traz `curl`), então
+`docker compose ps` mostra a saúde dos dois serviços.
+
+A senha do banco é parametrizada: `POSTGRES_PASSWORD` vale `dq` por padrão e é interpolada
+tanto no serviço `postgres` quanto no `DATABASE_URL` da API. Para subir sem a senha padrão:
+
+```bash
+POSTGRES_PASSWORD=uma-senha-sua docker compose up --build
+```
 
 | Serviço | URL |
 |---|---|
@@ -396,6 +405,7 @@ Os dois endpoints também estão montados em `/api/v1/health` e `/api/v1/health/
 |---|---|
 | `202 Accepted` | Todo corpo que foi lido como objeto ou array JSON, inclusive um lote inteiramente rejeitado |
 | `400 Bad Request` | Apenas erros de transporte: corpo que não é JSON decodificável, ou JSON escalar no topo (string, número, booleano, `null`) |
+| `413 Request Entity Too Large` | O array enviado tem mais de `MAX_BATCH_SIZE` elementos; nada é adjudicado nem gravado |
 | `503 Service Unavailable` | Falha de persistência (`PersistenceError`), com `trace_id` no corpo |
 | `500 Internal Server Error` | Exceção não tratada, com `trace_id` no corpo |
 
@@ -416,6 +426,7 @@ qualidade são puladas):
 | `INVALID_EVENT_ID` | ERROR / WARNING | String vazia ou em branco é ERROR; string fora do formato UUID é aceita e normalizada (WARNING) |
 | `INVALID_TIMESTAMP` | ERROR / WARNING | Não parseável como ISO-8601 é ERROR; sem fuso horário é assumido UTC (WARNING) |
 | `PAYLOAD_NOT_OBJECT` | ERROR / WARNING | `payload` ausente é sanitizado para `{}` (WARNING); de outro tipo é ERROR |
+| `ENVELOPE_STRING_TOO_LONG` | WARNING → trunca | `event_id`, `event_type` e `source` acima de `MAX_ENVELOPE_STRING_LENGTH`, que acompanha a largura `String(128)` das colunas — o limite é adjudicado pelo motor, nunca pelo banco |
 | `UNKNOWN_FIELD` | ERROR / WARNING | Chaves fora do envelope: ERROR em `STRICT_MODE=true`, senão movidas para `payload._extra` (WARNING) |
 | `UNPARSEABLE_ENVELOPE` | ERROR | O elemento não é um envelope interpretável (ex.: não é objeto, ou `event_type` não é string) |
 
@@ -426,12 +437,12 @@ Regras de qualidade (todas executam e todas as violações são acumuladas):
 | `NON_NUMERIC_METRIC` | ERROR | `temperature`/`humidity`/`value` presentes mas não convertíveis para número |
 | `TEMPERATURE_OUT_OF_RANGE` | WARNING → clampa | `payload.temperature` em `[TEMPERATURE_MIN, TEMPERATURE_MAX]` |
 | `HUMIDITY_OUT_OF_RANGE` | WARNING → clampa | `payload.humidity` em `[HUMIDITY_MIN, HUMIDITY_MAX]` |
-| `NEGATIVE_VALUE` | ERROR | `payload.value` deve ser `>= 0` |
-| `STRING_TOO_LONG` | WARNING → trunca | Qualquer string do payload acima de `MAX_STRING_LENGTH` |
+| `NEGATIVE_VALUE` | ERROR | `payload.value` deve ser `>= VALUE_MIN` (padrão `0.0`) |
+| `STRING_TOO_LONG` | WARNING → trunca | Strings no **primeiro nível** do payload acima de `MAX_STRING_LENGTH`; strings aninhadas dentro de objetos ou listas do payload não são inspecionadas |
 | `UNTRIMMED_STRING` | WARNING → apara | Espaços nas pontas de `event_type`/`source` |
 | `TIMESTAMP_IN_FUTURE` | ERROR | Mais de `FUTURE_TIMESTAMP_TOLERANCE_SECONDS` à frente de agora |
 | `TIMESTAMP_TOO_OLD` | ERROR | Mais antigo que `RETENTION_WINDOW_DAYS` |
-| `DUPLICATE_EVENT_ID` | ERROR | `event_id` já visto na janela de deduplicação em memória |
+| `DUPLICATE_EVENT_ID` | ERROR | `event_id` já visto na janela de deduplicação em memória (veja a semântica de retentativa na decisão D10) |
 
 A **severidade é que decide o roteamento** (decisão D7): `WARNING` muta a cópia de trabalho
 e o evento continua válido; `ERROR` manda o evento para o dead letter. Nenhuma regra decide
@@ -495,11 +506,28 @@ Uma linha por campo de `Settings` em `app/core/config.py`. O nome da variável �
 | `TEMPERATURE_MAX` | Teto do clamp de `payload.temperature` | `60.0` |
 | `HUMIDITY_MIN` | Piso do clamp de `payload.humidity` | `0.0` |
 | `HUMIDITY_MAX` | Teto do clamp de `payload.humidity` | `100.0` |
-| `MAX_STRING_LENGTH` | Tamanho máximo de uma string do payload antes do truncamento | `512` |
+| `VALUE_MIN` | Piso aceito para `payload.value` (abaixo disso é `NEGATIVE_VALUE`) | `0.0` |
+| `MAX_STRING_LENGTH` | Tamanho máximo de uma string do primeiro nível do payload antes do truncamento | `512` |
+| `MAX_ENVELOPE_STRING_LENGTH` | Tamanho máximo de `event_id`/`event_type`/`source`; deve acompanhar o `String(128)` das colunas | `128` |
 | `DEDUP_WINDOW_SIZE` | Quantidade de `event_id`s mantidos na LRU de deduplicação | `10000` |
+| `MAX_BATCH_SIZE` | Máximo de elementos aceitos em um array JSON por requisição (acima disso, `413`) | `1000` |
 | `LOG_LEVEL` | Nível do logging estruturado em JSON | `INFO` |
 
 Todos os limites usados pelo motor moram aqui: não existe número mágico inline nas regras.
+
+Duas variáveis são do `docker-compose.yml`, não de `Settings`:
+
+| Variável | Descrição | Padrão |
+|---|---|---|
+| `POSTGRES_PASSWORD` | Senha do PostgreSQL, interpolada também no `DATABASE_URL` da API | `dq` |
+
+Ela existe para que a stack não suba com uma senha conhecida fora do ambiente local:
+exporte `POSTGRES_PASSWORD` (ou coloque no `.env`) antes do `docker compose up`.
+
+`MAX_BATCH_SIZE` limita a **quantidade de eventos** por requisição, não o número de bytes.
+Em produção, combine com um limite de tamanho de corpo no proxy à frente da API — por
+exemplo `client_max_body_size 1m` no nginx — para que um corpo gigante seja recusado antes
+de chegar ao processo Python.
 
 ---
 
@@ -575,12 +603,24 @@ configuração do SDK está dentro de um `try/except` que só registra um warnin
   de `event_id`s recentes, por worker. É uma checagem barata de sanidade e **não** uma
   garantia distribuída: cada processo tem sua própria janela, e reiniciar o contêiner a
   zera. Um `SELECT` por evento dobraria as idas ao banco.
+  A janela é **transacional**: um `event_id` aprovado entra como *reserva* e só é
+  confirmado depois do commit. Daí a semântica de retentativa:
+  - evento **rejeitado** não consome o `event_id` — a versão corrigida pode ser reenviada
+    com o mesmo identificador;
+  - lote que falhou na persistência (`503`) libera as reservas — a retentativa é aceita, e
+    não volta como `DUPLICATE_EVENT_ID`;
+  - dentro do mesmo lote (ou entre requisições concorrentes) a reserva já vale: a segunda
+    cópia do mesmo `event_id` vai para o dead letter;
+  - depois do commit o `event_id` está consumido enquanto permanecer na janela, então um
+    reenvio idêntico é rejeitado como duplicado.
 - **D7 — Severidade decide o roteamento.** `WARNING` sanitiza e mantém o evento válido;
   `ERROR` manda para o dead letter. A partição por severidade é do motor, não da regra.
 - **D12/D13 — Falha de persistência vira `503`, nunca silêncio.** Os repositórios encapsulam
   `SQLAlchemyError` em `PersistenceError` e um handler devolve `503` com `trace_id`. Isso
   vale também para a escrita no dead letter: não "damos sucesso" a uma requisição cuja
-  trilha de auditoria foi perdida.
+  trilha de auditoria foi perdida. O `commit` final da requisição está sob o mesmo
+  contrato — um flush que passa seguido de um commit que falha (conexão caindo no meio da
+  requisição) é `503`, não `500`.
 
 ### Sobre a tag do Jaeger
 

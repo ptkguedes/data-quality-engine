@@ -11,7 +11,7 @@ from typing import Annotated
 from fastapi import Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.config import get_settings
+from app.core.config import Settings, get_settings
 from app.infrastructure.database import get_session
 from app.infrastructure.repositories import InvalidEventRepository, ValidEventRepository
 from app.services.data_quality import DataQualityEngine
@@ -19,6 +19,9 @@ from app.services.ingestion import IngestionService
 
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
 """Sessao assincrona por requisicao."""
+
+SettingsDep = Annotated[Settings, Depends(get_settings)]
+"""Configuracao da aplicacao, injetada para que os testes possam sobrescreve-la."""
 
 
 @lru_cache

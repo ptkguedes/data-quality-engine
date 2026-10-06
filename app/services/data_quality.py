@@ -71,9 +71,12 @@ REQUIRED_FIELDS: tuple[str, ...] = (
 )
 TRIMMED_FIELDS: tuple[str, ...] = (EVENT_TYPE_FIELD, SOURCE_FIELD)
 METRIC_FIELDS: tuple[str, ...] = ("temperature", "humidity", "value")
-
-MINIMUM_ALLOWED_VALUE = 0.0
-"""Piso de `payload.value`: e a definicao de "nao negativo", nao um limite ajustavel."""
+ENVELOPE_STRING_FIELDS: tuple[str, ...] = (
+    EVENT_ID_FIELD,
+    EVENT_TYPE_FIELD,
+    SOURCE_FIELD,
+)
+"""Campos do envelope gravados em colunas `String`; tamanho limitado pelo motor."""
 
 MILLISECONDS_PER_SECOND = 1000.0
 UTC_OFFSET_SUFFIX = "+00:00"
@@ -231,6 +234,45 @@ class EventIdRule:
             severity=Severity.WARNING,
             original=value,
             applied=normalised,
+        )
+
+
+class EnvelopeStringLengthRule:
+    """Trunca `event_id`, `event_type` e `source` em `max_envelope_string_length`.
+
+    As tres colunas correspondentes sao `String(128)`: sem esta regra, um
+    envelope com uma string maior que isso faria o INSERT falhar no
+    PostgreSQL - inclusive o INSERT do dead letter, que e justamente a trilha
+    que nunca pode ser perdida. O limite e adjudicado aqui, pelo motor, e nao
+    pelo banco: WARNING + truncamento registrado como sanitizacao.
+    """
+
+    code = RejectionReason.ENVELOPE_STRING_TOO_LONG
+    severity = Severity.WARNING
+
+    def __init__(self, settings: Settings) -> None:
+        self._max_length = settings.max_envelope_string_length
+
+    def evaluate(self, ctx: EvaluationContext) -> Violation | None:
+        """Trunca os campos longos do envelope e registra os tamanhos originais."""
+        original: dict[str, int] = {}
+        for name in ENVELOPE_STRING_FIELDS:
+            value = ctx.working.get(name)
+            if isinstance(value, str) and len(value) > self._max_length:
+                original[name] = len(value)
+                ctx.working[name] = value[: self._max_length]
+        if not original:
+            return None
+        return Violation(
+            code=self.code,
+            field=_join(original),
+            message=(
+                f"Campos do envelope acima de {self._max_length} caracteres "
+                f"truncados: {_join(original)}."
+            ),
+            severity=self.severity,
+            original=original,
+            applied=self._max_length,
         )
 
 
@@ -471,7 +513,7 @@ class NonNegativeValueRule:
     severity = Severity.ERROR
 
     def __init__(self, settings: Settings) -> None:
-        self._settings = settings
+        self._minimum = settings.value_min
 
     def evaluate(self, ctx: EvaluationContext) -> Violation | None:
         """Reporta ERROR quando `payload.value` e menor que o piso permitido."""
@@ -479,12 +521,12 @@ class NonNegativeValueRule:
         if payload.get("value") is None:
             return None
         current = _coerce_float(payload["value"])
-        if current is None or current >= MINIMUM_ALLOWED_VALUE:
+        if current is None or current >= self._minimum:
             return None
         return Violation(
             code=self.code,
             field=f"{PAYLOAD_FIELD}.value",
-            message=f"value deve ser maior ou igual a {MINIMUM_ALLOWED_VALUE}.",
+            message=f"value deve ser maior ou igual a {self._minimum}.",
             severity=self.severity,
             original=payload["value"],
         )
@@ -620,6 +662,13 @@ class DuplicateEventIdRule:
     LRU limitada a `dedup_window_size` entradas, em memoria: e uma checagem
     barata de sanidade, nao uma garantia distribuida - e deliberadamente NAO
     faz um `SELECT` por evento.
+
+    A janela tem DUAS fases por entrada. `mark_pending` registra um `event_id`
+    aprovado mas ainda nao confirmado (e isso que detecta o duplicado dentro
+    do mesmo lote e entre requisicoes concorrentes); `confirm` promove a
+    entrada depois do commit e `release` a devolve quando a transacao falha.
+    Resultado: um evento rejeitado, ou um lote que tomou 503, pode ser
+    reenviado com o mesmo `event_id` - a retentativa nao vira falso duplicado.
     """
 
     code = RejectionReason.DUPLICATE_EVENT_ID
@@ -627,26 +676,42 @@ class DuplicateEventIdRule:
 
     def __init__(self, settings: Settings) -> None:
         self._window_size = settings.dedup_window_size
-        self._seen: OrderedDict[str, None] = OrderedDict()
+        self._seen: OrderedDict[str, bool] = OrderedDict()
+        """`event_id` -> ja confirmado por um commit?"""
 
     def evaluate(self, ctx: EvaluationContext) -> Violation | None:
-        """Registra o `event_id` ou reporta ERROR se ele ja foi visto."""
+        """Reporta ERROR se o `event_id` ja esta na janela; nao registra nada."""
         event_id = ctx.working.get(EVENT_ID_FIELD)
         if not isinstance(event_id, str) or not event_id:
             return None
-        if event_id in self._seen:
-            self._seen.move_to_end(event_id)
-            return Violation(
-                code=self.code,
-                field=EVENT_ID_FIELD,
-                message=f"event_id ja visto na janela de deduplicacao: {event_id}.",
-                severity=self.severity,
-                original=event_id,
-            )
-        self._seen[event_id] = None
+        if event_id not in self._seen:
+            return None
+        self._seen.move_to_end(event_id)
+        return Violation(
+            code=self.code,
+            field=EVENT_ID_FIELD,
+            message=f"event_id ja visto na janela de deduplicacao: {event_id}.",
+            severity=self.severity,
+            original=event_id,
+        )
+
+    def mark_pending(self, event_id: str) -> None:
+        """Reserva o `event_id` na janela como pendente de confirmacao."""
+        self._seen[event_id] = False
+        self._seen.move_to_end(event_id)
         while len(self._seen) > self._window_size:
             self._seen.popitem(last=False)
-        return None
+
+    def confirm(self, event_id: str) -> None:
+        """Promove uma reserva a entrada confirmada (transacao commitada)."""
+        if event_id in self._seen:
+            self._seen[event_id] = True
+            self._seen.move_to_end(event_id)
+
+    def release(self, event_id: str) -> None:
+        """Descarta uma reserva nao confirmada, liberando o `event_id`."""
+        if self._seen.get(event_id) is False:
+            del self._seen[event_id]
 
 
 # --------------------------------------------------------------------------
@@ -657,6 +722,7 @@ RuleFactory = Callable[[Settings], QualityRule]
 SCHEMA_RULE_FACTORIES: tuple[RuleFactory, ...] = (
     RequiredFieldsRule,
     EventIdRule,
+    EnvelopeStringLengthRule,
     TimestampParseRule,
     PayloadObjectRule,
     UnknownFieldRule,
@@ -693,6 +759,14 @@ class DataQualityEngine:
         self._quality_rules: tuple[QualityRule, ...] = tuple(
             factory(settings) for factory in QUALITY_RULE_FACTORIES
         )
+        # A janela de deduplicacao tem ciclo de vida transacional
+        # (reservar -> confirmar / liberar), por isso o motor guarda a
+        # referencia da regra para expor `confirm_dedup` / `release_dedup`.
+        self._dedup = next(
+            rule
+            for rule in self._quality_rules
+            if isinstance(rule, DuplicateEventIdRule)
+        )
 
     @property
     def schema_rules(self) -> tuple[QualityRule, ...]:
@@ -719,6 +793,24 @@ class DataQualityEngine:
             self._record_metrics(result.status, elapsed_ms)
             return result
 
+    def confirm_dedup(self, event_ids: Iterable[str]) -> None:
+        """Confirma na janela de deduplicacao os `event_id` ja commitados.
+
+        Chamado pela camada de ingestao DEPOIS do commit: so a partir daqui um
+        `event_id` esta definitivamente consumido.
+        """
+        for event_id in event_ids:
+            self._dedup.confirm(event_id)
+
+    def release_dedup(self, event_ids: Iterable[str]) -> None:
+        """Libera as reservas de `event_id` de uma transacao que falhou.
+
+        Sem isso, a retentativa que o 503 convida voltaria rejeitada como
+        `DUPLICATE_EVENT_ID` e os eventos nunca chegariam a `valid_events`.
+        """
+        for event_id in event_ids:
+            self._dedup.release(event_id)
+
     # -- internals ---------------------------------------------------------
     def _adjudicate(self, raw: dict[str, Any]) -> ValidationResult:
         """Roda as regras e particiona as violacoes por severidade (D7/D9)."""
@@ -742,6 +834,13 @@ class DataQualityEngine:
             item for item in collected if item.severity is Severity.WARNING
         ]
         status = EventStatus.REJECTED if violations else EventStatus.SUCCESS
+        if status is EventStatus.SUCCESS:
+            # Reserva (nao confirma) o event_id aprovado: a confirmacao fica
+            # para depois do commit, via `confirm_dedup`. Eventos rejeitados
+            # nao entram na janela - a versao corrigida tem de poder voltar.
+            event_id = ctx.working.get(EVENT_ID_FIELD)
+            if isinstance(event_id, str) and event_id:
+                self._dedup.mark_pending(event_id)
         return ValidationResult(
             status=status,
             sanitized_event=ctx.working,

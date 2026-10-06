@@ -7,16 +7,23 @@ body, o FastAPI passa a devolver 422 e o evento invalido nunca chega ao dead
 letter - o produto perde exatamente a funcionalidade que justifica o servico.
 """
 
+import json
 from typing import Any
 from uuid import uuid4
 
 import httpx
 import pytest
+from fastapi import FastAPI, Request
 from sqlalchemy import func, select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.config import Settings
+from app.api.v1 import health as health_module
+from app.core.config import Settings, get_settings
+from app.domain.errors import PersistenceError
 from app.domain.models import InvalidEvent, ValidEvent
+from app.infrastructure.repositories import InvalidEventRepository, ValidEventRepository
+from app.main import unhandled_error_handler
 from app.services.data_quality import utcnow
 
 EVENTS_URL = "/api/v1/events"
@@ -27,7 +34,10 @@ V1_HEALTH_URL = "/api/v1/health"
 HTTP_ACCEPTED = 202
 HTTP_BAD_REQUEST = 400
 HTTP_OK = 200
+HTTP_PAYLOAD_TOO_LARGE = 413
 HTTP_UNPROCESSABLE = 422
+HTTP_INTERNAL_ERROR = 500
+HTTP_UNAVAILABLE = 503
 
 
 def _event(**overrides: Any) -> dict[str, Any]:
@@ -257,3 +267,139 @@ async def test_readiness_reports_the_database_as_ok(
 
     assert response.status_code == HTTP_OK
     assert response.json() == {"status": "ok", "database": "ok"}
+
+
+async def test_readiness_reports_503_when_the_database_is_down(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`SELECT 1` falhando faz o readiness responder 503 com `ErrorResponse`."""
+
+    async def _boom(session: AsyncSession) -> None:
+        raise SQLAlchemyError("banco fora do ar")
+
+    monkeypatch.setattr(health_module, "ping", _boom)
+
+    response = await client.get(READY_URL)
+
+    assert response.status_code == HTTP_UNAVAILABLE
+    body = response.json()
+    assert body["detail"] == health_module.DATABASE_UNAVAILABLE_DETAIL
+    assert "trace_id" in body
+
+
+# --------------------------------------------------------------------------
+# Falhas de persistencia: 503, nunca 500 e nunca silencio (D12/D13)
+# --------------------------------------------------------------------------
+async def test_persistence_error_on_the_valid_path_returns_503(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Falha ao gravar em `valid_events`: 503 com detalhe e `trace_id`."""
+
+    async def _boom(*args: Any, **kwargs: Any) -> None:
+        raise PersistenceError("Falha ao gravar o evento em valid_events")
+
+    monkeypatch.setattr(ValidEventRepository, "add", _boom)
+
+    response = await client.post(EVENTS_URL, json=_event())
+
+    assert response.status_code == HTTP_UNAVAILABLE
+    body = response.json()
+    assert body["detail"]
+    assert "trace_id" in body
+
+
+async def test_persistence_error_on_the_dead_letter_path_returns_503(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Falha ao gravar a auditoria tambem e 503: nao confirmamos o que nao gravamos."""
+
+    async def _boom(*args: Any, **kwargs: Any) -> None:
+        raise PersistenceError("Falha ao gravar o evento em invalid_events")
+
+    monkeypatch.setattr(InvalidEventRepository, "add", _boom)
+
+    response = await client.post(EVENTS_URL, json=_event(payload={"value": -1}))
+
+    assert response.status_code == HTTP_UNAVAILABLE
+    assert response.json()["detail"]
+
+
+async def test_commit_failure_returns_503_not_500(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Flush que passa e commit que falha e 503: o commit tambem e `PersistenceError`."""
+
+    async def _boom(self: AsyncSession) -> None:
+        raise SQLAlchemyError("commit falhou")
+
+    monkeypatch.setattr(AsyncSession, "commit", _boom)
+
+    response = await client.post(EVENTS_URL, json=_event())
+
+    assert response.status_code == HTTP_UNAVAILABLE
+    body = response.json()
+    assert body["detail"]
+    assert "trace_id" in body
+
+
+async def test_unhandled_exception_is_answered_with_500_and_trace_id() -> None:
+    """O handler de ultima instancia responde 500 com `ErrorResponse`.
+
+    Chamado direto porque o `ServerErrorMiddleware` do Starlette re-levanta a
+    excecao depois de enviar a resposta, e o `ASGITransport` a propagaria para
+    o teste em vez de devolver um `Response`.
+    """
+    scope: dict[str, Any] = {
+        "type": "http",
+        "method": "POST",
+        "path": EVENTS_URL,
+        "query_string": b"",
+        "headers": [],
+        "scheme": "http",
+        "server": ("test", 80),
+        "root_path": "",
+    }
+
+    response = await unhandled_error_handler(
+        Request(scope), RuntimeError("falha inesperada")
+    )
+
+    assert response.status_code == HTTP_INTERNAL_ERROR
+    body = json.loads(bytes(response.body))
+    assert body["detail"]
+    assert "trace_id" in body
+
+
+# --------------------------------------------------------------------------
+# Limite de tamanho do lote
+# --------------------------------------------------------------------------
+async def test_batch_above_the_limit_is_rejected_before_any_write(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    settings: Settings,
+    session: AsyncSession,
+) -> None:
+    """Array maior que `MAX_BATCH_SIZE`: 413 e nenhuma linha gravada."""
+    app.dependency_overrides[get_settings] = lambda: settings.model_copy(
+        update={"max_batch_size": 2}
+    )
+
+    response = await client.post(EVENTS_URL, json=[_event(), _event(), _event()])
+
+    assert response.status_code == HTTP_PAYLOAD_TOO_LARGE
+    assert "2" in response.json()["detail"]
+    assert (await session.execute(select(func.count(ValidEvent.id)))).scalar() == 0
+
+
+async def test_batch_at_the_limit_is_accepted(
+    client: httpx.AsyncClient, app: FastAPI, settings: Settings
+) -> None:
+    """Exatamente `MAX_BATCH_SIZE` elementos ainda passa."""
+    app.dependency_overrides[get_settings] = lambda: settings.model_copy(
+        update={"max_batch_size": 2}
+    )
+
+    response = await client.post(EVENTS_URL, json=[_event(), _event()])
+
+    assert response.status_code == HTTP_ACCEPTED
+    assert response.json()["accepted"] == 2

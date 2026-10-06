@@ -20,7 +20,7 @@ from typing import Any, cast
 
 from fastapi import APIRouter, HTTPException, Request, status
 
-from app.api.deps import IngestionServiceDep
+from app.api.deps import IngestionServiceDep, SettingsDep
 from app.core.telemetry import current_trace_id
 from app.domain.schemas import ErrorResponse, IngestionSummary
 
@@ -31,6 +31,9 @@ router = APIRouter()
 INVALID_JSON_DETAIL = "Corpo da requisicao nao e um JSON valido."
 INVALID_ROOT_DETAIL = (
     "O corpo deve ser um objeto JSON ou um array de objetos JSON."
+)
+BATCH_TOO_LARGE_DETAIL = (
+    "Lote acima do maximo permitido de {limit} eventos por requisicao."
 )
 
 _ACCEPTED_EXAMPLE: dict[str, Any] = {
@@ -89,6 +92,13 @@ _ACCEPTED_EXAMPLE: dict[str, Any] = {
                 "aceito com 202 e registrado em invalid_events."
             ),
         },
+        status.HTTP_413_REQUEST_ENTITY_TOO_LARGE: {
+            "model": ErrorResponse,
+            "description": (
+                "O array enviado tem mais elementos que MAX_BATCH_SIZE; nada "
+                "foi adjudicado nem gravado."
+            ),
+        },
         status.HTTP_503_SERVICE_UNAVAILABLE: {
             "model": ErrorResponse,
             "description": "Falha de persistencia: nenhum evento foi descartado.",
@@ -96,7 +106,7 @@ _ACCEPTED_EXAMPLE: dict[str, Any] = {
     },
 )
 async def ingest_events(
-    request: Request, service: IngestionServiceDep
+    request: Request, service: IngestionServiceDep, settings: SettingsDep
 ) -> IngestionSummary:
     """Valida e persiste um evento ou um lote, devolvendo o desfecho de cada um.
 
@@ -113,6 +123,7 @@ async def ingest_events(
         ) from exc
 
     items = _normalise(body)
+    _check_batch_size(items, settings.max_batch_size)
     # Um elemento que nao e objeto segue de proposito para o motor: ele sera
     # rejeitado como UNPARSEABLE_ENVELOPE e preservado no dead letter.
     return await service.ingest(
@@ -132,4 +143,20 @@ def _normalise(body: Any) -> list[Any]:
         return body
     raise HTTPException(
         status_code=status.HTTP_400_BAD_REQUEST, detail=INVALID_ROOT_DETAIL
+    )
+
+
+def _check_batch_size(items: list[Any], limit: int) -> None:
+    """Recusa um lote maior que `MAX_BATCH_SIZE` antes de qualquer adjudicacao.
+
+    O lote inteiro e validado e gravado em uma unica transacao, com todos os
+    resultados em memoria: um array sem limite seria um vetor de exaustao de
+    memoria em um endpoint exposto na rede.
+    """
+    if len(items) <= limit:
+        return
+    detail = BATCH_TOO_LARGE_DETAIL.format(limit=limit)
+    logger.warning("Lote recusado por tamanho", extra={"batch_size": len(items)})
+    raise HTTPException(
+        status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail=detail
     )

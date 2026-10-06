@@ -41,8 +41,17 @@ class Settings(BaseSettings):
     temperature_max: float = 60.0
     humidity_min: float = 0.0
     humidity_max: float = 100.0
+    value_min: float = 0.0
     max_string_length: int = 512
+    max_envelope_string_length: int = 128
+    """Teto das strings do envelope; deve acompanhar o `String(128)` das colunas
+    `event_id`, `event_type` e `source` para que o limite seja adjudicado pelo
+    motor e nunca pelo banco."""
     dedup_window_size: int = 10000
+
+    # --- Limites de requisicao --------------------------------------------
+    max_batch_size: int = 1000
+    """Maximo de elementos aceitos em um array JSON numa unica requisicao."""
 
     # --- Observabilidade ---------------------------------------------------
     log_level: str = "INFO"

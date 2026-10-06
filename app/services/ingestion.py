@@ -13,9 +13,11 @@ import logging
 from typing import Any
 
 from opentelemetry import trace
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.domain.enums import EventStatus
+from app.domain.errors import PersistenceError
 from app.domain.rules import ValidationResult, Violation
 from app.domain.schemas import EventResult, IngestionSummary, ViolationOut
 from app.infrastructure.repositories import InvalidEventRepository, ValidEventRepository
@@ -79,20 +81,29 @@ class IngestionService:
     ) -> IngestionSummary:
         """Adjudica e persiste cada item, devolvendo o resumo da requisicao."""
         results: list[EventResult] = []
+        reserved: list[str] = []
         accepted = 0
         rejected = 0
 
-        for item in items:
-            result = self._engine.validate(item)
-            if result.status is EventStatus.SUCCESS:
-                await self._persist_valid(result, trace_id)
-                accepted += 1
-            else:
-                await self._persist_invalid(item, result, trace_id)
-                rejected += 1
-            results.append(self._to_event_result(item, result))
+        try:
+            for item in items:
+                result = self._engine.validate(item)
+                if result.status is EventStatus.SUCCESS:
+                    reserved.extend(self._reserved_event_id(result))
+                    await self._persist_valid(result, trace_id)
+                    accepted += 1
+                else:
+                    await self._persist_invalid(item, result, trace_id)
+                    rejected += 1
+                results.append(self._to_event_result(item, result))
+            await self._commit()
+        except BaseException:
+            # A transacao nao vingou: as reservas de event_id saem da janela
+            # para que a retentativa nao volte como DUPLICATE_EVENT_ID (D10).
+            self._engine.release_dedup(reserved)
+            raise
 
-        await self._session.commit()
+        self._engine.confirm_dedup(reserved)
         return IngestionSummary(
             total=len(items),
             accepted=accepted,
@@ -101,6 +112,27 @@ class IngestionService:
         )
 
     # -- internals ---------------------------------------------------------
+    async def _commit(self) -> None:
+        """Confirma a transacao traduzindo falha em `PersistenceError` (D12).
+
+        O commit e a ultima chamada de banco da requisicao e precisa estar
+        sob o mesmo contrato dos repositorios: um flush que passa seguido de
+        um commit que falha e a forma normal de uma conexao caindo no meio da
+        requisicao, e isso tem de virar 503, nunca 500.
+        """
+        try:
+            await self._session.commit()
+        except SQLAlchemyError as exc:
+            raise PersistenceError(
+                "Falha ao confirmar a transacao da ingestao", cause=exc
+            ) from exc
+
+    @staticmethod
+    def _reserved_event_id(result: ValidationResult) -> tuple[str, ...]:
+        """`event_id` reservado na janela de deduplicacao por este resultado."""
+        event_id = _as_optional_str(result.sanitized_event.get(EVENT_ID_FIELD))
+        return (event_id,) if event_id is not None else ()
+
     async def _persist_valid(
         self, result: ValidationResult, trace_id: str | None
     ) -> None:

@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.api.deps import get_data_quality_engine
-from app.core.config import Settings
+from app.core.config import Settings, get_settings
 from app.infrastructure.database import get_session, init_models
 from app.main import create_app
 from app.services.data_quality import DataQualityEngine
@@ -61,7 +61,8 @@ def app(settings: Settings, engine: AsyncEngine) -> FastAPI:
     injetado via `dependency_overrides`. O motor de Data Quality tambem e
     sobrescrito: em producao ele e um singleton por processo (a LRU de
     deduplicacao, decisao D10), e um singleton cacheado vazaria `event_id`s
-    entre testes.
+    entre testes. `get_settings` e sobrescrito para que as rotas leiam os
+    mesmos limites de teste, e nao um `.env` do ambiente.
     """
     application = create_app(settings)
     factory = async_sessionmaker(engine, expire_on_commit=False)
@@ -71,6 +72,7 @@ def app(settings: Settings, engine: AsyncEngine) -> FastAPI:
             yield session
 
     application.dependency_overrides[get_session] = override_get_session
+    application.dependency_overrides[get_settings] = lambda: settings
     application.dependency_overrides[get_data_quality_engine] = (
         lambda: DataQualityEngine(settings)
     )

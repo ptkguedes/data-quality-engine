@@ -184,3 +184,95 @@ async def test_persistence_error_propagates_from_dead_letter_path(
 
     with pytest.raises(PersistenceError):
         await service.ingest([_event(payload={"value": -1})], trace_id=None)
+
+
+async def test_commit_failure_becomes_a_persistence_error(
+    service: IngestionService,
+    session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """O commit esta sob o mesmo contrato dos repositorios (D12).
+
+    Um flush que passa seguido de um commit que falha e a forma normal de uma
+    conexao caindo no meio da requisicao: precisa virar `PersistenceError` -
+    e portanto 503 - e nunca escapar como erro inesperado.
+    """
+
+    async def _boom() -> None:
+        raise SQLAlchemyError("commit falhou")
+
+    monkeypatch.setattr(session, "commit", _boom)
+
+    with pytest.raises(PersistenceError):
+        await service.ingest([_event()], trace_id=None)
+
+
+async def test_event_id_is_reusable_after_a_failed_transaction(
+    service: IngestionService,
+    session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A retentativa de um lote que tomou 503 nao volta como DUPLICATE_EVENT_ID."""
+    event = _event()
+
+    async def _boom() -> None:
+        raise SQLAlchemyError("commit falhou")
+
+    monkeypatch.setattr(session, "commit", _boom)
+    with pytest.raises(PersistenceError):
+        await service.ingest([event], trace_id=None)
+
+    monkeypatch.undo()
+    await session.rollback()
+
+    summary = await service.ingest([event], trace_id=None)
+
+    assert summary.accepted == 1
+    assert summary.results[0].status is EventStatus.SUCCESS
+    stored = (await session.execute(select(ValidEvent))).scalar_one()
+    assert stored.event_id == event["event_id"]
+
+
+async def test_duplicate_inside_the_same_batch_is_still_rejected(
+    service: IngestionService, session: AsyncSession
+) -> None:
+    """A reserva vale dentro do lote: a segunda copia vai para o dead letter."""
+    event = _event()
+
+    summary = await service.ingest([event, dict(event)], trace_id=None)
+
+    assert summary.accepted == 1
+    assert summary.rejected == 1
+    assert [item.code.value for item in summary.results[1].violations] == [
+        "DUPLICATE_EVENT_ID"
+    ]
+
+
+async def test_committed_event_id_is_rejected_on_a_later_request(
+    service: IngestionService, session: AsyncSession
+) -> None:
+    """Depois do commit o `event_id` esta consumido: reenvio e duplicado."""
+    event = _event()
+
+    await service.ingest([event], trace_id=None)
+    summary = await service.ingest([event], trace_id=None)
+
+    assert summary.rejected == 1
+    assert [item.code.value for item in summary.results[0].violations] == [
+        "DUPLICATE_EVENT_ID"
+    ]
+
+
+async def test_long_envelope_strings_fit_the_columns(
+    service: IngestionService, session: AsyncSession, settings: Settings
+) -> None:
+    """O truncamento do envelope mantem os valores dentro de `String(128)`."""
+    limit = settings.max_envelope_string_length
+    event = _event(event_type="t" * (limit + 50), source="s" * (limit + 50))
+
+    summary = await service.ingest([event], trace_id=None)
+
+    assert summary.accepted == 1
+    stored = (await session.execute(select(ValidEvent))).scalar_one()
+    assert len(stored.event_type) == limit
+    assert len(stored.source) == limit
