@@ -23,7 +23,10 @@ class RawEventPayload(BaseModel):
     event_type: str | None = None
     source: str | None = None
     timestamp: str | None = None
-    payload: dict[str, Any] | None = None
+    payload: Any = None
+    """Deliberadamente sem tipo: um `payload` que nao e objeto JSON e uma
+    violacao de Data Quality com codigo proprio (`PAYLOAD_NOT_OBJECT`) e deve
+    chegar ao dead letter, nao morrer aqui como envelope ilegivel."""
 
 
 class ViolationOut(BaseModel):

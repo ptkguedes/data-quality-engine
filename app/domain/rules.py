@@ -74,3 +74,5 @@ class ValidationResult:
     violations: list[Violation] = field(default_factory=list)
     sanitizations: list[Violation] = field(default_factory=list)
     rules_evaluated: int = 0
+    parsed_timestamp: datetime | None = None
+    """Timestamp do evento em UTC com fuso, usado pela camada de persistencia."""
