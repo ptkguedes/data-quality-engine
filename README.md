@@ -83,7 +83,7 @@ graph TD
     R -->|"Sim: REJECTED"| D["Dead letter invalid_events (raw_payload original + rejection_reasons)"]
     V --> RESP["HTTP 202 Accepted com IngestionSummary"]
     D --> RESP
-    E --> J["Spans e metricas exportados via OTLP/gRPC 4317 para o Jaeger"]
+    E --> J["Spans exportados via OTLP/gRPC 4317 para o Jaeger"]
     V --> J
     D --> J
 ```
@@ -499,6 +499,7 @@ Uma linha por campo de `Settings` em `app/core/config.py`. O nome da variável �
 | `OTEL_SDK_DISABLED` | `true` não instala nenhum provider: telemetria totalmente desligada | `false` |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | Collector OTLP/gRPC de destino | `http://jaeger:4317` |
 | `OTEL_SERVICE_NAME` | `service.name` nos traces, usado para filtrar no Jaeger | `data-quality-engine` |
+| `OTEL_METRICS_ENABLED` | Instala o `MeterProvider` e exporta métricas por OTLP. Desligado porque o Jaeger não ingere métricas | `false` |
 | `STRICT_MODE` | `true` transforma chave desconhecida no envelope em `ERROR` em vez de sanitização | `false` |
 | `FUTURE_TIMESTAMP_TOLERANCE_SECONDS` | Folga aceita para timestamps no futuro | `300` |
 | `RETENTION_WINDOW_DAYS` | Idade máxima aceita de um evento, em dias | `30` |
@@ -537,6 +538,14 @@ A instrumentação usa `FastAPIInstrumentor.instrument_app(app)` e
 `SQLAlchemyInstrumentor().instrument(engine=engine.sync_engine)`, com um `TracerProvider`
 que exporta por `BatchSpanProcessor` + OTLP/gRPC para o endpoint configurado.
 
+Os dois instrumentadores rodam em momentos diferentes (decisão D19): o da aplicação na
+**fábrica** (`create_app`), porque ele adiciona um middleware ASGI e o Starlette congela a
+pilha de middlewares no primeiro `__call__` — que é justamente o evento de `lifespan`; o do
+banco **no lifespan**, onde o engine existe. Com tudo no lugar, uma requisição rende um
+único trace: o span de servidor `POST /api/v1/events` como raiz, `data_quality.validate` e
+`ingestion.persist_*` como filhos, e os spans do SQLAlchemy (`connect`, `SELECT dq`,
+`INSERT dq`) abaixo deles.
+
 ### Encontrando um trace no Jaeger
 
 1. Abra http://localhost:16686.
@@ -565,8 +574,14 @@ Atributos disponíveis em `data_quality.validate`:
 Quando um evento é reprovado, o span recebe também o **evento de span** `event.rejected`,
 carregando `dq.violation_codes` — é o marcador para procurar na timeline.
 
-Métricas emitidas: o contador `dq.events.processed` (atributo `dq.status`) e o histograma
-`dq.validation.duration_ms`.
+Métricas instrumentadas: o contador `dq.events.processed` (atributo `dq.status`) e o
+histograma `dq.validation.duration_ms`. **A exportação de métricas vem desligada**
+(`OTEL_METRICS_ENABLED=false`): o Jaeger all-in-one ingere *traces* e responde
+`UNIMPLEMENTED` ao serviço OTLP de métricas, de modo que ligá-la apontando para o Jaeger só
+produziria um `ERROR` do exportador a cada intervalo, sem nenhuma métrica chegar a lugar
+algum. Os instrumentos continuam sendo alimentados pelo motor; para coletá-las de verdade,
+aponte `OTEL_EXPORTER_OTLP_ENDPOINT` para um collector que aceite métricas (um
+`otel-collector`, por exemplo) e marque `OTEL_METRICS_ENABLED=true`.
 
 Logs saem em JSON de uma linha, com `trace_id` e `span_id` do span corrente, o que permite
 pular do log direto para o trace.
@@ -613,6 +628,12 @@ configuração do SDK está dentro de um `try/except` que só registra um warnin
     cópia do mesmo `event_id` vai para o dead letter;
   - depois do commit o `event_id` está consumido enquanto permanecer na janela, então um
     reenvio idêntico é rejeitado como duplicado.
+- **D19 — Instrumentação em dois momentos.** `configure_telemetry(app, settings)` roda na
+  fábrica da aplicação, antes do startup, e `instrument_database(engine, settings)` roda no
+  lifespan. Chamar o `FastAPIInstrumentor` de dentro do lifespan levanta *"Cannot add
+  middleware after an application has started"*: o `try/except` da decisão D15 engole a
+  exceção e o serviço fica sem span de servidor e sem spans de banco, com cada span
+  explícito virando um trace órfão de um span só.
 - **D7 — Severidade decide o roteamento.** `WARNING` sanitiza e mantém o evento válido;
   `ERROR` manda para o dead letter. A partição por severidade é do motor, não da regra.
 - **D12/D13 — Falha de persistência vira `503`, nunca silêncio.** Os repositórios encapsulam
@@ -626,9 +647,9 @@ configuração do SDK está dentro de um `try/except` que só registra um warnin
 
 A imagem está pinada em `jaegertracing/all-in-one:1.62.0`, com a versão de patch completa.
 O alias curto `1.62` **não existe** no registry: o repositório publica `1.62.0`, e um
-`docker compose up` apontando para `1.62` falharia no pull. Como o daemon do Docker não
-estava disponível no ambiente de desenvolvimento, a tag foi conferida direto na API de tags
-do Docker Hub, não por `docker pull`.
+`docker compose up` apontando para `1.62` falharia no pull. A tag foi confirmada por
+`docker compose up --build` de verdade: os três contêineres sobem, o Jaeger recebe OTLP na
+4317 e os traces aparecem na UI.
 
 Alternativas diretas, caso o pull falhe: `jaegertracing/all-in-one:1.57` (esse repositório
 ainda publica o alias curto) ou `jaegertracing/all-in-one:latest`. A única exigência é uma

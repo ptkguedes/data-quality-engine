@@ -9,6 +9,23 @@ dentro de um `try/except` que apenas registra um aviso, e o
 inacessivel nao derruba o startup nem falha uma requisicao. Com
 `settings.otel_sdk_disabled=True` nenhum provider e instalado: e assim que a
 suite de testes e as execucoes locais sem Jaeger rodam.
+
+Decisao D17: os instrumentos de metrica existem sempre, mas a exportacao OTLP
+de metricas e opcional (`OTEL_METRICS_ENABLED`, desligada por padrao). O
+collector da stack e o Jaeger, que ingere apenas traces e responde
+`UNIMPLEMENTED` ao servico OTLP de metricas - sem o interruptor o exportador
+registraria um ERROR a cada intervalo, sem nenhum metrico chegar a lugar algum.
+
+Decisao D19: a instrumentacao e dividida em dois momentos porque os dois
+instrumentadores tem pre-requisitos diferentes:
+
+* `configure_telemetry` instala os providers e o `FastAPIInstrumentor` e roda
+  na **fabrica da aplicacao**. O instrumentador adiciona um middleware ASGI, e
+  o Starlette congela a pilha de middlewares no primeiro `__call__` - que e o
+  proprio evento de `lifespan`. Chamado de dentro do lifespan, ele levanta
+  "Cannot add middleware after an application has started" e a aplicacao fica
+  sem span de servidor: os spans explicitos viram traces orfaos de um span so.
+* `instrument_database` depende do engine, que so existe no lifespan.
 """
 
 from __future__ import annotations
@@ -47,10 +64,12 @@ TRACE_ID_HEX_WIDTH = 32
 """Largura do `trace_id` em hexadecimal, igual a coluna `trace_id` das tabelas."""
 
 
-def configure_telemetry(
-    app: FastAPI, engine: AsyncEngine, settings: Settings
-) -> None:
-    """Instala provider de traces/metricas e instrumenta FastAPI e SQLAlchemy.
+def configure_telemetry(app: FastAPI, settings: Settings) -> None:
+    """Instala provider de traces/metricas e instrumenta a aplicacao FastAPI.
+
+    Precisa ser chamada na fabrica da aplicacao, antes do startup: o
+    `FastAPIInstrumentor` adiciona um middleware e isso e impossivel depois que
+    a pilha de middlewares foi montada (decisao D19).
 
     Nao levanta excecao em nenhuma circunstancia: qualquer falha de montagem
     do SDK ou de contato com o collector e registrada como aviso e a aplicacao
@@ -77,31 +96,51 @@ def configure_telemetry(
         )
         trace.set_tracer_provider(tracer_provider)
 
-        meter_provider = MeterProvider(
-            resource=resource,
-            metric_readers=[
-                PeriodicExportingMetricReader(
-                    OTLPMetricExporter(
-                        endpoint=settings.otel_exporter_otlp_endpoint
+        if settings.otel_metrics_enabled:
+            meter_provider = MeterProvider(
+                resource=resource,
+                metric_readers=[
+                    PeriodicExportingMetricReader(
+                        OTLPMetricExporter(
+                            endpoint=settings.otel_exporter_otlp_endpoint
+                        )
                     )
-                )
-            ],
-        )
-        metrics.set_meter_provider(meter_provider)
+                ],
+            )
+            metrics.set_meter_provider(meter_provider)
 
         FastAPIInstrumentor.instrument_app(app)
-        SQLAlchemyInstrumentor().instrument(engine=engine.sync_engine)
 
         logger.info(
             "OpenTelemetry configurado",
             extra={
                 "otel_endpoint": settings.otel_exporter_otlp_endpoint,
                 "otel_service_name": settings.otel_service_name,
+                "otel_metrics_enabled": settings.otel_metrics_enabled,
             },
         )
     except Exception as exc:  # noqa: BLE001 - telemetria nunca derruba o app
         logger.warning(
             "Falha ao configurar o OpenTelemetry; a aplicacao segue sem telemetria",
+            extra={"otel_error": str(exc)},
+        )
+
+
+def instrument_database(engine: AsyncEngine, settings: Settings) -> None:
+    """Instrumenta o engine SQLAlchemy; chamada no lifespan (decisao D19).
+
+    Como `configure_telemetry`, nunca levanta excecao: sem instrumentacao de
+    banco a aplicacao continua servindo requisicoes.
+    """
+    if settings.otel_sdk_disabled:
+        return
+
+    try:
+        SQLAlchemyInstrumentor().instrument(engine=engine.sync_engine)
+        logger.info("SQLAlchemy instrumentado")
+    except Exception as exc:  # noqa: BLE001 - telemetria nunca derruba o app
+        logger.warning(
+            "Falha ao instrumentar o SQLAlchemy; a aplicacao segue sem esses spans",
             extra={"otel_error": str(exc)},
         )
 

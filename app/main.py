@@ -16,7 +16,11 @@ from app.api.v1 import health
 from app.api.v1.router import TAG_EVENTS, TAG_HEALTH, api_router
 from app.core.config import Settings, get_settings
 from app.core.logging import configure_logging
-from app.core.telemetry import configure_telemetry, current_trace_id
+from app.core.telemetry import (
+    configure_telemetry,
+    current_trace_id,
+    instrument_database,
+)
 from app.domain.errors import PersistenceError
 from app.domain.schemas import ErrorResponse
 from app.infrastructure.database import (
@@ -53,14 +57,17 @@ INTERNAL_ERROR_DETAIL = "Erro interno inesperado."
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """Prepara logging, banco e telemetria; libera o pool no shutdown."""
+    """Cria o banco e instrumenta o engine; libera o pool no shutdown.
+
+    O logging e a instrumentacao da aplicacao ficam em `create_app`: o
+    `FastAPIInstrumentor` precisa rodar antes do startup (decisao D19).
+    """
     settings = get_settings()
-    configure_logging(settings.log_level)
 
     engine = create_engine_from_settings(settings)
     set_engine(engine)
     await init_models(engine)
-    configure_telemetry(app, engine, settings)
+    instrument_database(engine, settings)
 
     logger.info(
         "Aplicacao iniciada",
@@ -108,8 +115,9 @@ async def unhandled_error_handler(request: Request, exc: Exception) -> JSONRespo
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
-    """Constroi a aplicacao FastAPI com rotas, handlers e lifespan."""
+    """Constroi a aplicacao FastAPI com rotas, handlers, logging e telemetria."""
     settings = settings or get_settings()
+    configure_logging(settings.log_level)
 
     app = FastAPI(
         title=settings.app_name,
@@ -126,6 +134,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app.add_exception_handler(PersistenceError, persistence_error_handler)
     app.add_exception_handler(Exception, unhandled_error_handler)
+
+    # Antes do startup, enquanto a pilha de middlewares ainda aceita adicoes
+    # (decisao D19).
+    configure_telemetry(app, settings)
 
     return app
 

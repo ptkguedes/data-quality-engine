@@ -32,6 +32,14 @@ class Settings(BaseSettings):
     otel_sdk_disabled: bool = False
     otel_exporter_otlp_endpoint: str = "http://jaeger:4317"
     otel_service_name: str = "data-quality-engine"
+    otel_metrics_enabled: bool = False
+    """Exportacao OTLP de metricas, desligada por padrao (decisao D17).
+
+    O collector da stack e o Jaeger, que ingere **traces**: o servico OTLP de
+    metricas responde `UNIMPLEMENTED` e o exportador registraria um ERROR a
+    cada intervalo de exportacao. Os instrumentos continuam sendo alimentados
+    pelo motor; ligue esta variavel ao apontar o
+    `OTEL_EXPORTER_OTLP_ENDPOINT` para um collector que aceite metricas."""
 
     # --- Motor de Data Quality --------------------------------------------
     strict_mode: bool = False
