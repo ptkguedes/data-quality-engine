@@ -1,5 +1,7 @@
 # Real-time Event Ingestion & Data Quality Engine
 
+[![CI](https://github.com/ptkguedes/data-quality-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/ptkguedes/data-quality-engine/actions/workflows/ci.yml)
+
 Serviço de ingestão de eventos em tempo real escrito em **Python 3.12 + FastAPI**, com um
 motor de **Data Quality** componível, persistência assíncrona em **PostgreSQL 15** e
 rastreamento distribuído via **OpenTelemetry** exportado para **Jaeger**.
